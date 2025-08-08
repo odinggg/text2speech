@@ -22,7 +22,7 @@
 ## 📂 项目结构
 
 
-
+```text
 text2speech_project/
 ├── results/ # 输出目录
 │ ├── metadata/ # 存放任务元数据 JSON 文件 (输入)
@@ -41,6 +41,8 @@ text2speech_project/
 ├── .env.example # 环境变量示例文件
 ├── pyproject.toml # 项目定义和依赖管理
 └── ...
+```
+
 ## 🚀 安装与设置
 
 1.  **克隆仓库**
