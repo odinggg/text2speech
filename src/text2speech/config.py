@@ -1,39 +1,35 @@
-# src/text_to_speech_app/config.py
+# src/text2speech/config.py
 import os
+from dotenv import load_dotenv
 
-# --- 基础路径配置 ---
-# 获取项目根目录 (text_to_speech_project)
-# 由于此文件在 src/text_to_speech_app/ 下，我们需要向上移动三级
+# [新增] 从 .env 文件加载环境变量，这对于本地开发非常方便
+# 在生产环境中，您应该直接设置系统的环境变量
+load_dotenv()
+
+# --- 基础路径配置 (保持不变) ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 RESULTS_DIR = os.path.join(BASE_DIR, 'results')
 METADATA_DIR = os.path.join(RESULTS_DIR, 'metadata')
 SPLITDATA_DIR = os.path.join(RESULTS_DIR, 'splitdata')
 VOICEDATA_DIR = os.path.join(RESULTS_DIR, 'voicedata')
+VECTORTEMP_DIR = os.path.join(RESULTS_DIR, 'vectortemp')
 
-# --- 文本分块配置 ---
-# Langchain 文本分块器使用
-# Chunk Size: 每个文本块的目标大小（字符数）
-CHUNK_SIZE = 1000
-# Chunk Overlap: 相邻文本块之间的重叠字符数，以保持上下文连续性
-CHUNK_OVERLAP = 0
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000)) # 每个块的目标最大字符数
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 0))  # 细分时，块之间的重叠字符数
+# --- TTS 服务配置 (从环境变量加载) ---
+TTS_BASE_URL = os.getenv("TTS_BASE_URL", "http://127.0.0.1:8080:443")
+TTS_ENDPOINT = os.getenv("TTS_ENDPOINT", "/tts/fast")
+# 注意：环境变量返回的是字符串，需要转换为整数
+TTS_REQUEST_TIMEOUT = int(os.getenv("TTS_REQUEST_TIMEOUT", 60000))
 
-# --- TTS 服务配置 ---
-# 您的 TTS 服务 API 地址
-TTS_BASE_URL = "http://127.0.0.1:8000"
-TTS_ENDPOINT = "/tts/fast"
-# 请求超时时间（秒），以防止长时间等待
-TTS_REQUEST_TIMEOUT = 600
-# 并发请求数，以避免对TTS服务器造成过大压力
-MAX_CONCURRENT_REQUESTS = 1
+# --- Embedding 服务配置 (从环境变量加载) ---
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "123456")
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://127.0.0.1:8080/v1")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "qwen3")
+# 注意：环境变量返回的是字符串，需要转换为浮点数
+SEMANTIC_SPLIT_THRESHOLD = float(os.getenv("SEMANTIC_SPLIT_THRESHOLD", 0.3))
 
-EMBEDDING_API_KEY = "YOUR_API_KEY_HERE"
-EMBEDDING_BASE_URL = "https://opengpt.fuckll.com/v1"
-# 常见的 Embedding 模型名称
-EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
-# 语义分割阈值：当相邻句子的相似度低于此值时，进行分割。
-# 值越低，分割出的块越大；值越高，块越小。推荐范围 0.2-0.5
-SEMANTIC_SPLIT_THRESHOLD = 0.3
-
-# --- 日志配置 ---
-LOG_LEVEL = "INFO"
+# --- 日志配置 (从环境变量加载) ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+

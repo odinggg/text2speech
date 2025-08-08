@@ -1,283 +1,328 @@
-# src/text_to_speech_app/processor.py
-import asyncio
-import os
-import uuid
-import logging
-from datetime import datetime
+# src/text2speech/processor.py
 import json
-from typing import List, Dict, Any, TypedDict, Optional
+import logging
+import os
+import re
+import time
+import uuid
+from datetime import datetime
+from typing import List, Dict, Optional
 
-import aiohttp
-import aiofiles
+import numpy as np
+import requests
+# [新增] 导入 LangChain 的文本分割器
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from pydantic import BaseModel, Field, SecretStr
 from pydub import AudioSegment
 from tqdm import tqdm
-from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field, SecretStr
-from langchain_openai import OpenAIEmbeddings # <-- 替换为 Embedding 客户端
-import numpy as np
-import nltk
 
-import config
+from . import config
 from .text_utils import clean_text_for_tts
 
 logger = logging.getLogger(__name__)
 
-# 尝试下载NLTK的句子分割模型，如果失败则提示用户
-try:
-    nltk.data.find('tokenizers/punkt')
-except nltk.downloader.DownloadError:
-    logger.info("NLTK 'punkt' tokenizer not found. Downloading...")
-    nltk.download('punkt')
-    logger.info("'punkt' downloaded successfully.")
 
 # --- Pydantic Models for Configuration ---
 class TTSConfig(BaseModel):
     base_url: str = Field(default=config.TTS_BASE_URL)
     endpoint: str = Field(default=config.TTS_ENDPOINT)
     timeout: int = Field(default=config.TTS_REQUEST_TIMEOUT)
-    max_concurrent_requests: int = Field(default=config.MAX_CONCURRENT_REQUESTS)
+
 
 class EmbeddingConfig(BaseModel):
-    """用于语义文本分块的 Embedding 服务配置。"""
     api_key: SecretStr = Field(default=config.EMBEDDING_API_KEY)
     base_url: Optional[str] = Field(default=config.EMBEDDING_BASE_URL)
     model_name: str = Field(default=config.EMBEDDING_MODEL_NAME)
-    split_threshold: float = Field(default=config.SEMANTIC_SPLIT_THRESHOLD,
-                                   description="语义分割阈值")
+    split_threshold: float = Field(default=config.SEMANTIC_SPLIT_THRESHOLD)
 
-# --- LangGraph State Definition ---
-class GraphState(TypedDict):
-    metadata_path: str
-    task_id: str
-    metadata: Dict[str, Any]
-    task_voicedata_dir: str
-    final_audio_paths: List[str]
-    processing_start_time: str
 
 class TextToSpeechProcessor:
-    """使用 LangGraph 管理文本转语音的工作流。"""
     def __init__(self, tts_config: Optional[TTSConfig] = None, embedding_config: Optional[EmbeddingConfig] = None):
-        """初始化处理器，配置TTS和Embedding客户端。"""
         self.tts_config = tts_config or TTSConfig()
         self.embedding_config = embedding_config or EmbeddingConfig()
+        # [新增] 初始化一个基于大小的文本分割器，用于细分过大的块
+        self.size_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=config.CHUNK_SIZE,
+            chunk_overlap=config.CHUNK_OVERLAP
+        )
+        logger.info(f"处理器已初始化。块大小约束: {config.CHUNK_SIZE}, 重叠: {config.CHUNK_OVERLAP}")
 
+    def _update_metadata(self, metadata_path: str, new_data: Dict):
+        """安全地更新元数据文件。"""
         try:
-            self.embedding_client = OpenAIEmbeddings(
-                model=self.embedding_config.model_name,
-                api_key=self.embedding_config.api_key,
-                base_url=self.embedding_config.base_url,
-            )
-            logger.info(f"Embedding 客户端初始化成功。模型: {self.embedding_config.model_name}")
-        except Exception:
-            logger.error("初始化 Embedding 客户端失败！请检查 API Key 或网络连接。", exc_info=True)
-            raise
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(new_data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logger.critical(f"写入元数据文件失败: {metadata_path}", exc_info=True)
 
-        self.app = self._build_graph()
+    def _get_embeddings(self, sentences: List[str]) -> Optional[np.ndarray]:
+        # ... 此方法逻辑不变 ...
+        embedding_url = f"{self.embedding_config.base_url}/embeddings"
+        headers = {"Content-Type": "application/json"}
+        payload = {"input": sentences, "model": self.embedding_config.model_name}
+        try:
+            response = requests.post(embedding_url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            if "data" in data and isinstance(data["data"], list):
+                embeddings = [item["embedding"] for item in sorted(data["data"], key=lambda x: x["index"])]
+                return np.array(embeddings)
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"请求 Embedding API 时出错: {e}")
+            return None
 
     def _cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
-        """计算两个向量之间的余弦相似度。"""
+        # ... 此方法逻辑不变 ...
         dot_product = np.dot(vec1, vec2)
         norm_vec1 = np.linalg.norm(vec1)
         norm_vec2 = np.linalg.norm(vec2)
-        if norm_vec1 == 0 or norm_vec2 == 0:
-            return 0.0
-        return dot_product / (norm_vec1 * norm_vec2)
+        return 0.0 if norm_vec1 == 0 or norm_vec2 == 0 else dot_product / (norm_vec1 * norm_vec2)
 
-    async def _intelligent_split(self, text: str) -> List[str]:
-        """使用 Embedding 和语义相似度将文本分割成块。"""
-        logger.debug("正在使用 Embedding 进行语义文本分块...")
-        # 1. 使用 NLTK 将文本分割成句子
-        sentences = nltk.sent_tokenize(text)
+    def _intelligent_split(self, text: str) -> List[str]:
+        """[修改] 使用混合策略进行文本分割。"""
+        logger.info("步骤 1: 开始进行混合文本分块...")
+
+        # --- 阶段 A: 语义分割 ---
+        text_norm = re.sub(r'([。！？\?])([^”’])', r"\1\n\2", text)
+        text_norm = re.sub(r'(\.{6})([^”’])', r"\1\n\2", text_norm)
+        text_norm = re.sub(r'(\…{2})([^”’])', r"\1\n\2", text_norm)
+        text_norm = re.sub(r'([。！？\?][”’])([^，。！？\?])', r'\1\n\2', text_norm)
+        sentences = [s.strip() for s in text_norm.split('\n') if s.strip()]
+
         if len(sentences) <= 1:
-            logger.debug("文本只有一个句子或更少，无需分割。")
-            return sentences
+            logger.info("文本只有一个句子或更少，跳过语义分割。")
+            semantic_chunks = [text]
+        else:
+            try:
+                embeddings = self._get_embeddings(sentences)
+                if embeddings is None: raise ValueError("获取 embeddings 失败")
 
-        try:
-            # 2. 为所有句子批量生成 Embedding 向量
-            logger.debug(f"正在为 {len(sentences)} 个句子生成 embeddings...")
-            embeddings = await self.embedding_client.aembed_documents(sentences)
-            embeddings = np.array(embeddings)
-            logger.debug("Embeddings 生成完毕。")
+                similarities = [self._cosine_similarity(embeddings[i], embeddings[i + 1]) for i in
+                                range(len(embeddings) - 1)]
+                semantic_chunks, start_idx = [], 0
+                for i, sim in enumerate(similarities):
+                    if sim < self.embedding_config.split_threshold:
+                        semantic_chunks.append(" ".join(sentences[start_idx: i + 1]))
+                        start_idx = i + 1
+                semantic_chunks.append(" ".join(sentences[start_idx:]))
+                logger.info(f"语义分割完成，得到 {len(semantic_chunks)} 个初始块。")
+            except Exception:
+                logger.error("语义分块时出错，将整个文本作为一个块处理。", exc_info=True)
+                semantic_chunks = [text]
 
-            # 3. 计算相邻句子之间的余弦相似度
-            similarities = [
-                self._cosine_similarity(embeddings[i], embeddings[i+1])
-                for i in range(len(embeddings) - 1)
-            ]
-
-            # 4. 根据阈值确定分割点
-            chunks = []
-            current_chunk_start_index = 0
-            for i, similarity in enumerate(similarities):
-                if similarity < self.embedding_config.split_threshold:
-                    # 语义差异大，在此处分割
-                    chunk_sentences = sentences[current_chunk_start_index : i + 1]
-                    chunks.append(" ".join(chunk_sentences))
-                    current_chunk_start_index = i + 1
-
-            # 5. 添加最后一个块
-            last_chunk_sentences = sentences[current_chunk_start_index:]
-            if last_chunk_sentences:
-                chunks.append(" ".join(last_chunk_sentences))
-
-            logger.debug(f"文本被成功分割成 {len(chunks)} 个语义块。")
-            return chunks
-
-        except Exception:
-            logger.error("语义分块时出错，将回退到将整个文本作为单个块返回。", exc_info=True)
-            return [text]
-
-    # ... _fetch_tts_audio 和 _merge_and_cleanup_chunks 方法保持不变 ...
-    async def _fetch_tts_audio(self, session: aiohttp.ClientSession, text: str, output_path: str) -> bool:
-        tts_url = f"{self.tts_config.base_url}{self.tts_config.endpoint}"
-        form_data = aiohttp.FormData()
-        form_data.add_field('text', text)
-        try:
-            timeout = aiohttp.ClientTimeout(total=self.tts_config.timeout)
-            async with session.post(tts_url, data=form_data, timeout=timeout) as response:
-                if response.status == 200:
-                    async with aiofiles.open(output_path, 'wb') as f:
-                        await f.write(await response.read())
-                    logger.debug(f"成功生成音频文件: {output_path}")
-                    return True
-                else:
-                    logger.error(f"TTS API 请求失败，状态码: {response.status}, 文件: {os.path.basename(output_path)}, 响应: {await response.text()}")
-                    return False
-        except asyncio.TimeoutError:
-            logger.error(f"TTS API 请求超时: {tts_url} for file {os.path.basename(output_path)}")
-            return False
-        except Exception as e:
-            logger.error(f"请求TTS API时发生未知错误: {e}, 文件: {os.path.basename(output_path)}")
-            return False
-
-    def _merge_and_cleanup_chunks(self, task_id: str, chapter_number: str, chunk_count: int):
-        task_voicedata_dir = os.path.join(config.VOICEDATA_DIR, task_id)
-        logger.info(f"开始合并章节 {chapter_number} 的 {chunk_count} 个音频片段...")
-        combined_audio = AudioSegment.empty()
-        chunk_files_to_remove = []
-        for i in range(chunk_count):
-            chunk_file_path = os.path.join(task_voicedata_dir, f"{chapter_number}_{i}.wav")
-            chunk_files_to_remove.append(chunk_file_path)
-            if os.path.exists(chunk_file_path):
-                try:
-                    segment = AudioSegment.from_wav(chunk_file_path)
-                    combined_audio += segment
-                except Exception as e:
-                    logger.warning(f"无法加载或合并音频片段 {chunk_file_path}: {e}。跳过此片段。")
+        # --- 阶段 B: 大小约束 ---
+        final_chunks = []
+        logger.info(f"开始应用大小约束 (最大 {config.CHUNK_SIZE} 字符)...")
+        for chunk in semantic_chunks:
+            if len(chunk) > config.CHUNK_SIZE:
+                logger.info(f"一个语义块长度 ({len(chunk)}) 超出限制，正在进行细分...")
+                sub_chunks = self.size_splitter.split_text(chunk)
+                final_chunks.extend(sub_chunks)
+                logger.info(f"  -> 已细分为 {len(sub_chunks)} 个更小的块。")
             else:
-                logger.warning(f"音频片段文件不存在: {chunk_file_path}。跳过此片段。")
-        final_audio_path = os.path.join(task_voicedata_dir, f"{chapter_number}.wav")
-        try:
-            combined_audio.export(final_audio_path, format="wav")
-            logger.info(f"章节 {chapter_number} 音频合并完成，已保存至: {final_audio_path}")
-        except Exception as e:
-            logger.error(f"导出合并音频文件失败: {final_audio_path}, 错误: {e}")
-            return
-        logger.info(f"清理章节 {chapter_number} 的临时音频片段...")
-        for file_path in chunk_files_to_remove:
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except OSError as e:
-                    logger.error(f"删除文件失败: {file_path}, 错误: {e}")
+                final_chunks.append(chunk)
 
-    # --- LangGraph Nodes ---
-    def _node_start_processing(self, state: GraphState) -> GraphState:
-        metadata_path = state["metadata_path"]
-        logger.info(f"Node [1]: Starting process for metadata file: '{os.path.basename(metadata_path)}'")
+        logger.info(f"步骤 1 完成: 混合分割完成，最终得到 {len(final_chunks)} 个块。")
+        return final_chunks
+
+    # ... 其他方法 (_fetch_tts_audio, _run_splitting_phase, 等) 保持不变 ...
+    def _fetch_tts_audio(self, text: str, output_path: str) -> bool:
+        """[修改] 带重试逻辑的 TTS 请求方法。"""
+        tts_url = f"{self.tts_config.base_url}{self.tts_config.endpoint}"
+        form_data = {'text': (None, text)}
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            logger.info(f"正在尝试第 {attempt + 1}/{max_retries} 次请求 TTS 服务 (内容: '{text[:30]}...')")
+            try:
+                response = requests.post(tts_url, files=form_data, timeout=self.tts_config.timeout)
+                response.raise_for_status()
+
+                if len(response.content) < 1024:
+                    logger.warning(f"TTS 响应内容过小 ({len(response.content)} bytes)，可能无效。正在重试...")
+                    time.sleep(5)
+                    continue
+
+                with open(output_path, 'wb') as f:
+                    f.write(response.content)
+
+                if os.path.getsize(output_path) < 1024:
+                    logger.warning(f"保存后的 TTS 文件过小，可能已损坏。正在重试...")
+                    os.remove(output_path)
+                    time.sleep(5)
+                    continue
+
+                logger.info(f"成功生成并保存音频文件: {output_path}")
+                return True
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"第 {attempt + 1} 次请求 TTS API 时发生 HTTP 错误: {e}")
+                if attempt < max_retries - 1:
+                    logger.info("将在5秒后重试...")
+                    time.sleep(5)
+                else:
+                    logger.critical("已达到最大重试次数，TTS 转换失败。")
+                    return False
+
+        return False
+
+    def _run_splitting_phase(self, metadata_path: str, metadata: Dict) -> bool:
+        task_id = metadata['task_id']
+        logger.info(f"--- [阶段 1: 文本分割] 开始或继续任务 {task_id} ---")
+
+        vectortemp_dir = os.path.join(config.VECTORTEMP_DIR, task_id)
+        os.makedirs(vectortemp_dir, exist_ok=True)
+        metadata['vectortemp_dir'] = vectortemp_dir
+
+        for chap_file_rel_path in metadata.get('split_files', []):
+            chapter_number = os.path.splitext(os.path.basename(chap_file_rel_path))[0]
+
+            if metadata.get('chapters', {}).get(chapter_number, {}).get('status') == 'split_completed':
+                logger.info(f"章节 {chapter_number} 已分割，跳过。")
+                continue
+
+            logger.info(f"正在处理章节: {chapter_number}")
+            metadata['progress'] = {'current_phase': 'splitting', 'current_chapter': chapter_number}
+            self._update_metadata(metadata_path, metadata)
+
+            chapter_file_path = os.path.join(config.SPLITDATA_DIR, task_id, os.path.basename(chap_file_rel_path))
+            try:
+                with open(chapter_file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+            except Exception:
+                logger.error(f"读取章节文件失败: {chapter_file_path}", exc_info=True)
+                continue
+
+            chunks = self._intelligent_split(text)
+
+            chapter_chunks_info = []
+            for i, chunk_text in enumerate(chunks):
+                chunk_filename = f"{chapter_number}-{i}.txt"
+                chunk_filepath = os.path.join(vectortemp_dir, chunk_filename)
+                with open(chunk_filepath, 'w', encoding='utf-8') as f: f.write(chunk_text)
+                chapter_chunks_info.append({'path': chunk_filepath, 'status': 'pending'})
+
+            if 'chapters' not in metadata: metadata['chapters'] = {}
+            metadata['chapters'][chapter_number] = {'status': 'split_completed', 'chunks': chapter_chunks_info}
+            self._update_metadata(metadata_path, metadata)
+            logger.info(f"章节 {chapter_number} 分割完成，保存了 {len(chunks)} 个块。")
+
+        metadata['progress']['current_phase'] = 'tts'
+        self._update_metadata(metadata_path, metadata)
+        logger.info(f"--- [阶段 1: 文本分割] 任务 {task_id} 全部完成 ---")
+        return True
+
+    def _run_tts_phase(self, metadata_path: str, metadata: Dict) -> bool:
+        task_id = metadata['task_id']
+        logger.info(f"--- [阶段 2: 语音转换] 开始或继续任务 {task_id} ---")
+
+        task_voicedata_dir = os.path.join(config.VOICEDATA_DIR, task_id)
+        os.makedirs(task_voicedata_dir, exist_ok=True)
+
+        all_chapters = metadata.get('chapters', {})
+        for chapter_number, chapter_data in all_chapters.items():
+            if chapter_data.get('status') == 'tts_completed':
+                logger.info(f"章节 {chapter_number} 的 TTS 已完成，跳过。")
+                continue
+
+            logger.info(f"正在为章节 {chapter_number} 生成语音...")
+
+            all_chunks_successful = True
+            for i, chunk_info in enumerate(tqdm(chapter_data['chunks'], desc=f"章节 {chapter_number} TTS")):
+                if chunk_info['status'] == 'completed':
+                    continue
+
+                metadata['progress'] = {
+                    'current_phase': 'tts',
+                    'current_chapter': chapter_number,
+                    'current_chunk': i
+                }
+                self._update_metadata(metadata_path, metadata)
+
+                chunk_text_path = chunk_info['path']
+                try:
+                    with open(chunk_text_path, 'r', encoding='utf-8') as f:
+                        chunk_text = f.read()
+                except Exception:
+                    logger.error(f"读取分块文件失败: {chunk_text_path}", exc_info=True)
+                    all_chunks_successful = False
+                    break
+
+                clean_chunk = clean_text_for_tts(chunk_text)
+                chunk_audio_filename = f"{chapter_number}-{i}.wav"
+                chunk_audio_path = os.path.join(task_voicedata_dir, chunk_audio_filename)
+
+                if not self._fetch_tts_audio(clean_chunk, chunk_audio_path):
+                    all_chunks_successful = False
+                    logger.critical(f"块 {chunk_text_path} TTS 转换在多次重试后最终失败。中止任务 {task_id}。")
+                    break
+                else:
+                    metadata['chapters'][chapter_number]['chunks'][i]['status'] = 'completed'
+                    self._update_metadata(metadata_path, metadata)
+
+            if not all_chunks_successful:
+                return False
+
+            logger.info(f"正在合并章节 {chapter_number} 的音频...")
+            combined_audio = AudioSegment.empty()
+            for i in range(len(chapter_data['chunks'])):
+                chunk_audio_path = os.path.join(task_voicedata_dir, f"{chapter_number}-{i}.wav")
+                if os.path.exists(chunk_audio_path):
+                    combined_audio += AudioSegment.from_wav(chunk_audio_path)
+
+            final_audio_path = os.path.join(task_voicedata_dir, f"{chapter_number}.wav")
+            combined_audio.export(final_audio_path, format="wav")
+
+            if 'final_audio_files' not in metadata: metadata['final_audio_files'] = []
+            relative_final_path = os.path.join('voicedata', task_id, f"{chapter_number}.wav").replace('\\', '/')
+            if relative_final_path not in metadata['final_audio_files']:
+                metadata['final_audio_files'].append(relative_final_path)
+
+            metadata['chapters'][chapter_number]['status'] = 'tts_completed'
+            self._update_metadata(metadata_path, metadata)
+            logger.info(f"章节 {chapter_number} 音频合并完成。")
+
+            for i in range(len(chapter_data['chunks'])):
+                os.remove(os.path.join(task_voicedata_dir, f"{chapter_number}-{i}.wav"))
+            logger.info(f"已清理章节 {chapter_number} 的临时音频文件。")
+
+        metadata['progress'] = {'current_phase': 'completed'}
+        metadata['voice_task_id'] = metadata.get('voice_task_id', str(uuid.uuid4()))
+        metadata['audio_processing_end_time'] = datetime.now().isoformat()
+        self._update_metadata(metadata_path, metadata)
+        logger.info(f"--- [阶段 2: 语音转换] 任务 {task_id} 全部完成 ---")
+        return True
+
+    def run(self, metadata_path: str):
+        logger.info(f"===== 开始处理元数据文件: {os.path.basename(metadata_path)} =====")
         try:
             with open(metadata_path, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
-            task_id = os.path.basename(metadata_path).replace('-metadata.json', '')
-            task_voicedata_dir = os.path.join(config.VOICEDATA_DIR, task_id)
-            os.makedirs(task_voicedata_dir, exist_ok=True)
-            return {**state, "metadata": metadata, "task_id": task_id, "task_voicedata_dir": task_voicedata_dir, "final_audio_paths": [], "processing_start_time": datetime.now().isoformat()}
-        except Exception as e:
-            logger.error(f"Failed to read or parse metadata file: {metadata_path}", exc_info=True)
-            return {**state, "metadata": {"error": True}}
+        except (FileNotFoundError, json.JSONDecodeError):
+            logger.error(f"无法加载或解析元数据: {metadata_path}")
+            return
 
-    async def _node_process_chapters(self, state: GraphState) -> GraphState:
-        """节点：遍历章节，使用语义分块，生成并合并音频。"""
-        logger.info("Node [2]: Processing all chapters to generate audio...")
-        task_id, metadata = state["task_id"], state["metadata"]
-        final_audio_paths = []
-        semaphore = asyncio.Semaphore(self.tts_config.max_concurrent_requests)
+        if 'progress' not in metadata:
+            metadata['progress'] = {'current_phase': 'pending'}
+        if 'task_id' not in metadata:
+            metadata['task_id'] = os.path.basename(metadata_path).replace('-metadata.json', '')
+        if 'audio_processing_start_time' not in metadata:
+            metadata['audio_processing_start_time'] = datetime.now().isoformat()
 
-        async with aiohttp.ClientSession() as session:
-            for chapter_file_relative_path in metadata.get('split_files', []):
-                chapter_file_path = os.path.join(config.SPLITDATA_DIR, task_id, os.path.basename(chapter_file_relative_path))
-                chapter_number = os.path.splitext(os.path.basename(chapter_file_path))[0]
-                if not os.path.exists(chapter_file_path):
-                    logger.warning(f"Chapter file not found: {chapter_file_path}, skipping.")
-                    continue
-                try:
-                    with open(chapter_file_path, 'r', encoding='utf-8') as f:
-                        text = f.read()
-                except Exception as e:
-                    logger.error(f"Failed to read chapter file: {chapter_file_path}", exc_info=True)
-                    continue
+        current_phase = metadata['progress']['current_phase']
 
-                chunks = await self._intelligent_split(text)
-                logger.info(f"章节 {chapter_number} 被语义分割成 {len(chunks)} 个块。")
+        if current_phase in ['pending', 'splitting']:
+            if not self._run_splitting_phase(metadata_path, metadata):
+                logger.error(f"任务 {metadata['task_id']} 在分割阶段失败。")
+                return
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            current_phase = metadata['progress']['current_phase']
 
-                tts_tasks = []
-                for i, chunk in enumerate(chunks):
-                    clean_chunk = clean_text_for_tts(chunk)
-                    if not clean_chunk: continue
-                    output_path = os.path.join(state["task_voicedata_dir"], f"{chapter_number}_{i}.wav")
-                    async def do_fetch(sem, text, path):
-                        async with sem:
-                            return await self._fetch_tts_audio(session, text, path)
-                    tts_tasks.append(do_fetch(semaphore, clean_chunk, output_path))
+        if current_phase == 'tts':
+            if not self._run_tts_phase(metadata_path, metadata):
+                logger.error(f"任务 {metadata['task_id']} 在 TTS 阶段失败，已中止。")
+                return
 
-                logger.info(f"正在为章节 {chapter_number} 的 {len(tts_tasks)} 个块生成音频...")
-                results = []
-                for f in tqdm(asyncio.as_completed(tts_tasks), total=len(tts_tasks), desc=f"Chapter {chapter_number} Audio"):
-                    results.append(await f)
-
-                if not all(results):
-                    logger.warning(f"章节 {chapter_number} 的部分音频块生成失败，合并结果可能不完整。")
-
-                self._merge_and_cleanup_chunks(task_id, chapter_number, len(chunks))
-                final_audio_path = os.path.join('voicedata', task_id, f"{chapter_number}.wav")
-                final_audio_paths.append(final_audio_path.replace('\\', '/'))
-
-        return {**state, "final_audio_paths": final_audio_paths}
-
-    def _node_update_metadata(self, state: GraphState) -> GraphState:
-        logger.info("Node [3]: Finalizing process and updating metadata file.")
-        metadata = state["metadata"]
-        metadata['voice_task_id'] = str(uuid.uuid4())
-        metadata['audio_files'] = state["final_audio_paths"]
-        metadata['audio_processing_start_time'] = state["processing_start_time"]
-        metadata['audio_processing_end_time'] = datetime.now().isoformat()
-        try:
-            with open(state["metadata_path"], 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, ensure_ascii=False, indent=4)
-            logger.info(f"Task {state['task_id']} metadata updated successfully!")
-        except Exception as e:
-            logger.critical(f"Failed to write updated metadata for task {state['task_id']}", exc_info=True)
-        return state
-
-    def _edge_should_process(self, state: GraphState) -> str:
-        if state["metadata"].get("error"): return "end"
-        if 'voice_task_id' in state["metadata"]:
-            logger.info(f"Task '{state['metadata'].get('source_filename')}' (ID: {state['task_id']}) has already been processed. Skipping.")
-            return "end"
-        else:
-            return "continue"
-
-    def _build_graph(self) -> StateGraph:
-        workflow = StateGraph(GraphState)
-        workflow.add_node("start", self._node_start_processing)
-        workflow.add_node("process_chapters", self._node_process_chapters)
-        workflow.add_node("update_metadata", self._node_update_metadata)
-        workflow.set_entry_point("start")
-        workflow.add_conditional_edges("start", self._edge_should_process, {"continue": "process_chapters", "end": END})
-        workflow.add_edge("process_chapters", "update_metadata")
-        workflow.add_edge("update_metadata", END)
-        return workflow.compile()
-
-    async def run(self, metadata_path: str):
-        initial_state = {"metadata_path": metadata_path}
-        await self.app.ainvoke(initial_state)
+        logger.info(f"===== 任务 {metadata['task_id']} 已成功完成。 =====")

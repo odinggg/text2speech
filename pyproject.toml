@@ -12,10 +12,12 @@ dependencies = [
     "aiohttp>=3.12.15",
     "langchain>=0.3.27",
     "langchain-openai>=0.3.28",
+    "langgraph>=0.6.4",
     "nltk>=3.9.1",
     "numpy>=2.3.2",
     "pydantic>=2.11.7",
     "pydub>=0.25.1",
+    "python-dotenv>=1.1.1",
     "requests>=2.32.4",
     "tqdm>=4.67.1",
 ]
