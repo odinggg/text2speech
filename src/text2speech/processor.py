@@ -61,7 +61,7 @@ class TextToSpeechProcessor:
         headers = {"Content-Type": "application/json"}
         payload = {"input": sentences, "model": self.embedding_config.model_name}
         try:
-            response = requests.post(embedding_url, headers=headers, json=payload, timeout=60)
+            response = requests.post(embedding_url, headers=headers, json=payload, timeout=self.tts_config.timeout)
             response.raise_for_status()
             data = response.json()
             if "data" in data and isinstance(data["data"], list):
