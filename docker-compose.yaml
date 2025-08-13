@@ -1,0 +1,13 @@
+services:
+  text2speech:
+#    image: ${MY_IMAGE}
+    build:
+        context: .
+        dockerfile: Dockerfile
+    container_name: text2speech
+    volumes:
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    ports:
+      - "9102:8000"
