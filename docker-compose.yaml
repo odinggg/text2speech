@@ -6,8 +6,4 @@ services:
         dockerfile: Dockerfile
     container_name: text2speech
     volumes:
-      - ./logs:/app/logs
-    env_file:
-      - .env
-    ports:
-      - "9102:8000"
+      - ./results:/app/results
