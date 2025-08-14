@@ -7,3 +7,5 @@ services:
     container_name: text2speech
     volumes:
       - ./results:/app/results
+    env_file:
+      - .env
