@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- 基础路径配置 (保持不变) ---
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BASE_DIR = os.getenv("BASE_DIR", "./")
 RESULTS_DIR = os.path.join(BASE_DIR, 'results')
 METADATA_DIR = os.path.join(RESULTS_DIR, 'metadata')
 SPLITDATA_DIR = os.path.join(RESULTS_DIR, 'splitdata')
