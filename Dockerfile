@@ -2,8 +2,8 @@
 FROM python:3.12-slim
 
 # 设置环境变量，防止 Python 生成 .pyc 文件和进行缓冲
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 # 从官方镜像中复制 uv 二进制文件，这是推荐的安装方式
 # 锁定到特定版本以确保可复现的构建
